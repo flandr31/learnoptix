@@ -1,5 +1,7 @@
 export default {
   async fetch(request, env) {
+    const webhookReceivedMs = Date.now();
+
     if (request.method === "GET") {
       return new Response("LearnOptix Trading Alerts Webhook is ONLINE", {
         status: 200,
@@ -40,6 +42,11 @@ export default {
     const setupId = clean(data.setup_id, "") || clean(data.setupId, "");
     const eventTime = clean(data.time, "");
 
+    // r6 timing fields. All are optional so the Worker stays backward-compatible.
+    const chochCandleMs = unixSecondsToMs(data.choch_candle_unix_s);
+    const chochConfirmMs = unixSecondsToMs(data.choch_confirm_unix_s);
+    const tvAlertTriggeredMs = parseIsoMs(data.alert_triggered_at);
+
     const alignmentText = `${status} ${data.setup || ""}`.toUpperCase();
 
     const isAlignment =
@@ -66,14 +73,49 @@ export default {
             ? "🔴"
             : "🟡";
 
+      const timingLines = [];
+
+      if (chochCandleMs !== null) {
+        timingLines.push(`1M CHoCH Candle: ${formatPhilippineTime(chochCandleMs)}`);
+      }
+
+      if (chochConfirmMs !== null) {
+        timingLines.push(`CHoCH Confirmed: ${formatPhilippineTime(chochConfirmMs)}`);
+      }
+
+      if (tvAlertTriggeredMs !== null) {
+        timingLines.push(`TV Alert Triggered: ${formatPhilippineTime(tvAlertTriggeredMs)}`);
+      }
+
+      timingLines.push(`Webhook Received: ${formatPhilippineTime(webhookReceivedMs)}`);
+
+      if (chochConfirmMs !== null) {
+        timingLines.push(`CHoCH → Worker: ${formatDuration(webhookReceivedMs - chochConfirmMs)}`);
+      }
+
+      if (chochConfirmMs !== null && tvAlertTriggeredMs !== null) {
+        timingLines.push(`CHoCH → TV Alert: ${formatDuration(tvAlertTriggeredMs - chochConfirmMs)}`);
+      }
+
+      if (tvAlertTriggeredMs !== null) {
+        timingLines.push(`TV Alert → Worker: ${formatDuration(webhookReceivedMs - tvAlertTriggeredMs)}`);
+      }
+
+      const directionCode = direction === "BULLISH" ? "BULL" : direction === "BEARISH" ? "BEAR" : "ALIGN";
+      const timestampedSetupId =
+        chochCandleMs !== null
+          ? `MTF-${directionCode}-${symbol}-${formatSetupIdPHT(chochCandleMs)}`
+          : setupId;
+
       telegramText =
         `${directionEmoji} LEARNOPTIX TRADING SIGNAL\n\n` +
         `${symbol} - ${direction}\n\n` +
         `15M + 1M ${direction} ALIGNMENT\n\n` +
         `Price: ${entry || "-"}\n` +
         `Chart TF: ${timeframe || "1M"}` +
-        (eventTime ? `\nTime: ${eventTime}` : "") +
-        (setupId ? `\nSetup ID: ${setupId}` : "");
+        (timingLines.length ? `\n\n${timingLines.join("\n")}` : "") +
+        (eventTime && tvAlertTriggeredMs === null ? `\nTime: ${eventTime}` : "") +
+        (timestampedSetupId ? `\nSetup ID: ${timestampedSetupId}` : "");
     } else {
       const displaySide = side || clean(data.side, "-");
 
@@ -132,7 +174,12 @@ export default {
     return jsonResponse({
       success: true,
       message: "Signal sent to Telegram",
-      type: isAlignment ? "alignment" : "trade"
+      type: isAlignment ? "alignment" : "trade",
+      webhook_received_at: new Date(webhookReceivedMs).toISOString(),
+      choch_to_worker_ms:
+        isAlignment && chochConfirmMs !== null
+          ? Math.max(0, webhookReceivedMs - chochConfirmMs)
+          : null
     }, 200);
   }
 };
@@ -155,6 +202,76 @@ function normalizeSide(value) {
   }
 
   return text;
+}
+
+function unixSecondsToMs(value) {
+  const text = clean(value, "");
+  if (!text) return null;
+
+  const seconds = Number(text);
+  if (!Number.isFinite(seconds) || seconds <= 0) return null;
+
+  return Math.round(seconds * 1000);
+}
+
+function parseIsoMs(value) {
+  const text = clean(value, "");
+  if (!text) return null;
+
+  const ms = Date.parse(text);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function formatPhilippineTime(ms) {
+  try {
+    return new Intl.DateTimeFormat("en-PH", {
+      timeZone: "Asia/Manila",
+      year: "numeric",
+      month: "short",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: true
+    }).format(new Date(ms)) + " PHT";
+  } catch (_) {
+    return new Date(ms).toISOString();
+  }
+}
+
+
+function formatSetupIdPHT(ms) {
+  try {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Manila",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23"
+    }).formatToParts(new Date(ms));
+
+    const map = Object.fromEntries(parts.map(part => [part.type, part.value]));
+    return `${map.year}${map.month}${map.day}-${map.hour}${map.minute}${map.second}`;
+  } catch (_) {
+    return new Date(ms).toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
+  }
+}
+
+function formatDuration(ms) {
+  if (!Number.isFinite(ms)) return "-";
+
+  const safeMs = Math.max(0, Math.round(ms));
+  if (safeMs < 1000) return `${safeMs} ms`;
+
+  const seconds = safeMs / 1000;
+  if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)} sec`;
+
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = Math.round(seconds % 60);
+  return `${minutes}m ${remainingSeconds}s`;
 }
 
 function jsonResponse(payload, status = 200) {
